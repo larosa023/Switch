@@ -1,0 +1,38 @@
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a release.
+# The built-in updater downloads Switch.exe and verifies it against Switch.exe.sha256.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$ver" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $ver" }
+
+      - run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target/release/Switch.exe Switch.exe
+          $hash = (Get-FileHash Switch.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path Switch.exe.sha256 -Value "$hash  Switch.exe" -NoNewline -Encoding ascii
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Switch.exe
+            Switch.exe.sha256
+          generate_release_notes: true
