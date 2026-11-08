@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod config;
+mod fuzzy;
 mod gfx;
 mod hook;
 mod settings_ui;
@@ -26,6 +27,7 @@ use crate::util::{wide, UiCell};
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_SETTINGS: u32 = WM_APP + 2;
 const WM_OPEN_SWITCHER: u32 = WM_APP + 3;
+const WM_QUIT_APP: u32 = WM_APP + 4;
 const TIMER_UPDATE: usize = 10;
 
 const ID_OPEN: usize = 100;
@@ -45,7 +47,12 @@ static APP: UiCell<App> = UiCell::new();
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // --updated: started by the updater; --restart: relaunched (e.g. as admin).
+    // Both wait for the previous instance to exit.
     let updated = args.iter().any(|a| a == "--updated");
+    let restarted = updated || args.iter().any(|a| a == "--restart");
+    let quit = args.iter().any(|a| a == "--quit");
+    let settings = args.iter().any(|a| a == "--settings");
     let background = args.iter().any(|a| a == "--background");
     // `Switch.exe --open` opens the switcher (handy for mouse buttons, Stream Deck, etc.).
     let open = args.iter().any(|a| a == "--open");
@@ -56,25 +63,34 @@ fn main() {
         // Single instance. After an update the old process may still be exiting.
         let name = wide("Local\\Switch.SingleInstance.larosa023");
         let mut mutex = None;
-        for _ in 0..if updated { 50 } else { 1 } {
+        for _ in 0..if restarted { 50 } else { 1 } {
             let m = CreateMutexW(None, true, PCWSTR(name.as_ptr()));
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 if let Ok(h) = m {
                     let _ = CloseHandle(h);
                 }
-                if updated {
+                if restarted {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     continue;
                 }
                 // Already running: bring up its settings window instead.
                 if let Ok(other) = FindWindowW(w!("Switch.Main"), PCWSTR::null()) {
-                    let m = if open { WM_OPEN_SWITCHER } else { WM_SHOW_SETTINGS };
+                    let m = if quit {
+                        WM_QUIT_APP
+                    } else if open {
+                        WM_OPEN_SWITCHER
+                    } else {
+                        WM_SHOW_SETTINGS
+                    };
                     let _ = PostMessageW(other, m, WPARAM(0), LPARAM(0));
                 }
                 return;
             }
             mutex = m.ok();
             break;
+        }
+        if quit {
+            return;
         }
         if mutex.is_none() {
             util::log("could not acquire single-instance mutex");
@@ -136,7 +152,7 @@ fn main() {
         }
         if open {
             let _ = PostMessageW(main, WM_OPEN_SWITCHER, WPARAM(0), LPARAM(0));
-        } else if !background && !first_run && !updated {
+        } else if settings || (!background && !first_run && !restarted) {
             // Launched by hand while not running: show settings so it's obvious it started.
             settings_ui::show();
         }
@@ -312,7 +328,14 @@ fn on_update_state(lparam: isize) {
     let app = APP.get();
     match updater::state() {
         State::Available(r) if lparam == 1 => {
-            if app.notified_version.as_deref() != Some(&r.version) {
+            if config::cfg().auto_install {
+                // Don't swap the exe out from under an open switcher; the next check retries.
+                if !switcher::is_active() {
+                    updater::install_async();
+                }
+                return;
+            }
+            if config::cfg().notify_updates && app.notified_version.as_deref() != Some(&r.version) {
                 app.notified_version = Some(r.version.clone());
                 balloon(
                     &format!("Switch {} is available", r.version),
@@ -344,7 +367,10 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_TRAY => {
             // NOTIFYICON_VERSION_4: event in LOWORD(lParam).
             match (l.0 & 0xFFFF) as u32 {
-                WM_LBUTTONUP => settings_ui::show(),
+                WM_LBUTTONUP => match config::cfg().tray_click {
+                    config::TrayClick::Settings => settings_ui::show(),
+                    config::TrayClick::Switcher => switcher::open_sticky(),
+                },
                 WM_CONTEXTMENU | WM_RBUTTONUP => tray_menu(h),
                 NIN_BALLOONUSERCLICK => match updater::state() {
                     State::Available(_) => updater::install_async(),
@@ -352,6 +378,10 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 },
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_QUIT_APP => {
+            PostQuitMessage(0);
             LRESULT(0)
         }
         WM_OPEN_SWITCHER => {
@@ -380,5 +410,49 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             LRESULT(0)
         }
         _ => DefWindowProcW(h, msg, w, l),
+    }
+}
+
+/// Is this process running elevated?
+pub fn is_elevated() -> bool {
+    use windows::Win32::Security::*;
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elev.TokenIsElevated != 0
+    }
+}
+
+/// Relaunch elevated (UAC prompt). Quits this instance only if the user accepted.
+pub fn restart_as_admin() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let file = wide(&exe.to_string_lossy());
+    let verb = wide("runas");
+    let params = wide("--restart --background");
+    unsafe {
+        let r = ShellExecuteW(
+            HWND::default(),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR(params.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        if r.0 as isize > 32 {
+            PostQuitMessage(0);
+        }
     }
 }

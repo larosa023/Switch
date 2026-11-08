@@ -1,6 +1,7 @@
 //! Enumerates the windows that belong in an Alt-Tab list, in Z (≈ MRU) order.
 
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
@@ -8,7 +9,8 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Threading::*;
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::UI::Shell::{ExtractIconExW, IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::util::{self, from_wide, wide, UiCell};
@@ -27,6 +29,9 @@ pub struct WinInfo {
     pub topmost: bool,
     /// Width / height of the window's normal (restored) bounds.
     pub aspect: f32,
+    pub maximized: bool,
+    /// Lives on another virtual desktop.
+    pub other_desktop: bool,
 }
 
 #[derive(Default)]
@@ -42,23 +47,36 @@ fn caches() -> &'static mut Caches {
     CACHES.get()
 }
 
-unsafe fn is_cloaked(h: HWND) -> bool {
+unsafe fn cloak_value(h: HWND) -> u32 {
     let mut cloaked: u32 = 0;
-    DwmGetWindowAttribute(
+    let _ = DwmGetWindowAttribute(
         h,
         DWMWA_CLOAKED,
         &mut cloaked as *mut u32 as *mut _,
         std::mem::size_of::<u32>() as u32,
-    )
-    .is_ok()
-        && cloaked != 0
+    );
+    cloaked
+}
+
+static VDM: UiCell<Option<IVirtualDesktopManager>> = UiCell::new();
+
+/// Is the window on another virtual desktop (rather than cloaked for some other reason)?
+unsafe fn on_other_desktop(h: HWND) -> bool {
+    if VDM.try_get().is_none() {
+        VDM.set(CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL).ok());
+    }
+    match VDM.get() {
+        Some(vdm) => matches!(vdm.IsWindowOnCurrentVirtualDesktop(h), Ok(b) if !b.as_bool()),
+        None => false,
+    }
 }
 
 /// Raymond Chen's Alt-Tab eligibility test plus the modern extras (cloaking,
 /// tool windows, no-activate windows).
-unsafe fn eligible(h: HWND) -> bool {
+/// Returns Some(on_other_desktop) for windows that belong in the list.
+unsafe fn eligible(h: HWND, allow_other_desktops: bool) -> Option<bool> {
     if !IsWindowVisible(h).as_bool() {
-        return false;
+        return None;
     }
     let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
     if ex & WS_EX_APPWINDOW.0 == 0 {
@@ -73,25 +91,31 @@ unsafe fn eligible(h: HWND) -> bool {
             walk = tryw;
         }
         if walk != h {
-            return false;
+            return None;
         }
         if ex & WS_EX_TOOLWINDOW.0 != 0 {
-            return false;
+            return None;
         }
     }
     if ex & WS_EX_NOACTIVATE.0 != 0 {
-        return false;
+        return None;
     }
-    if is_cloaked(h) {
-        return false;
+    let mut other = false;
+    let cloak = cloak_value(h);
+    if cloak != 0 {
+        // DWM_CLOAKED_SHELL: the shell hides windows on other virtual desktops this way.
+        if !(allow_other_desktops && cloak == 2 && on_other_desktop(h)) {
+            return None;
+        }
+        other = true;
     }
     let mut cls = [0u16; 64];
     let n = GetClassNameW(h, &mut cls);
     let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
     if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-        return false;
+        return None;
     }
-    GetWindowTextLengthW(h) > 0
+    (GetWindowTextLengthW(h) > 0).then_some(other)
 }
 
 pub fn process_path(pid: u32) -> Option<String> {
@@ -220,21 +244,26 @@ unsafe fn aspect_of(h: HWND, minimized: bool) -> f32 {
     }
 }
 
-pub fn enumerate() -> Vec<WinInfo> {
-    let mut handles: Vec<HWND> = Vec::with_capacity(64);
+pub fn enumerate(allow_other_desktops: bool) -> Vec<WinInfo> {
+    struct Ctx {
+        handles: Vec<(HWND, bool)>,
+        other: bool,
+    }
+    let mut ctx = Ctx { handles: Vec::with_capacity(64), other: allow_other_desktops };
     unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
-        let v = &mut *(l.0 as *mut Vec<HWND>);
-        if eligible(h) {
-            v.push(h);
+        let c = &mut *(l.0 as *mut Ctx);
+        if let Some(o) = eligible(h, c.other) {
+            c.handles.push((h, o));
         }
         true.into()
     }
     unsafe {
-        let _ = EnumWindows(Some(cb), LPARAM(&mut handles as *mut _ as isize));
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut _ as isize));
     }
+    let handles = ctx.handles;
     let own_pid = std::process::id();
     let mut out = Vec::with_capacity(handles.len());
-    for h in handles {
+    for (h, other_desktop) in handles {
         unsafe {
             let mut pid = 0u32;
             GetWindowThreadProcessId(h, Some(&mut pid));
@@ -271,6 +300,8 @@ pub fn enumerate() -> Vec<WinInfo> {
                 minimized,
                 topmost: ex & WS_EX_TOPMOST.0 != 0,
                 aspect: aspect_of(h, minimized),
+                maximized: IsZoomed(h).as_bool(),
+                other_desktop,
             });
         }
     }
@@ -381,5 +412,88 @@ pub fn monitor_work_area(mon: HMONITOR) -> RECT {
         };
         let _ = GetMonitorInfoW(mon, &mut mi);
         mi.rcWork
+    }
+}
+
+pub fn toggle_maximize(h: isize) -> bool {
+    unsafe {
+        let hw = util::hwnd(h);
+        let max = IsZoomed(hw).as_bool();
+        let _ = ShowWindowAsync(hw, if max { SW_RESTORE } else { SW_MAXIMIZE });
+        !max
+    }
+}
+
+/// All monitors, left to right.
+pub fn monitors() -> Vec<HMONITOR> {
+    unsafe extern "system" fn cb(m: HMONITOR, _: HDC, _: *mut RECT, l: LPARAM) -> BOOL {
+        (*(l.0 as *mut Vec<HMONITOR>)).push(m);
+        true.into()
+    }
+    let mut v: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(HDC::default(), None, Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v.sort_by_key(|m| {
+        let r = monitor_rect(*m);
+        (r.left, r.top)
+    });
+    v
+}
+
+pub fn monitor_rect(mon: HMONITOR) -> RECT {
+    unsafe {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(mon, &mut mi);
+        mi.rcMonitor
+    }
+}
+
+/// Move a window to the next (dir = 1) or previous (dir = -1) monitor,
+/// keeping its relative position and size.
+pub fn move_to_monitor(h: isize, dir: i32) {
+    unsafe {
+        let hw = util::hwnd(h);
+        let mons = monitors();
+        if mons.len() < 2 {
+            return;
+        }
+        let cur = MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST);
+        let i = mons.iter().position(|m| *m == cur).unwrap_or(0) as i32;
+        let target = mons[((i + dir).rem_euclid(mons.len() as i32)) as usize];
+        let (from, to) = (monitor_work_area(cur), monitor_work_area(target));
+        let was_max = IsZoomed(hw).as_bool();
+        if was_max {
+            let _ = ShowWindow(hw, SW_RESTORE);
+        }
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hw, &mut r);
+        let (fw, fh) = ((from.right - from.left).max(1) as f32, (from.bottom - from.top).max(1) as f32);
+        let (tw, th) = ((to.right - to.left) as f32, (to.bottom - to.top) as f32);
+        let w = ((r.right - r.left) as f32).min(tw);
+        let hh = ((r.bottom - r.top) as f32).min(th);
+        let rx = (r.left - from.left) as f32 / fw;
+        let ry = (r.top - from.top) as f32 / fh;
+        let x = to.left as f32 + (rx * tw).clamp(0.0, tw - w);
+        let y = to.top as f32 + (ry * th).clamp(0.0, th - hh);
+        let _ = SetWindowPos(hw, HWND::default(), x as i32, y as i32, w as i32, hh as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+        if was_max {
+            let _ = ShowWindow(hw, SW_MAXIMIZE);
+        }
+    }
+}
+
+pub fn open_location(w: &WinInfo) {
+    if w.exe_path.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{}\"", w.exe_path))
+        .spawn();
+}
+
+pub fn new_window(w: &WinInfo) {
+    if !w.exe_path.is_empty() {
+        util::shell_open(&w.exe_path);
     }
 }

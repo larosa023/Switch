@@ -44,9 +44,32 @@ pub struct Release {
     pub exe_url: String,
     pub sha_url: Option<String>,
     pub page: String,
+    /// Release notes (markdown body of the GitHub release).
+    pub notes: String,
 }
 
 pub static STATE: Mutex<State> = Mutex::new(State::Idle);
+/// Unix time of the last successful check.
+pub static LAST_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// "just now", "5 min ago", ... or None if never checked.
+pub fn last_checked_label() -> Option<String> {
+    let t = LAST_CHECK.load(std::sync::atomic::Ordering::Relaxed);
+    if t == 0 {
+        return None;
+    }
+    let d = now_secs().saturating_sub(t);
+    Some(match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86399 => format!("{} h ago", d / 3600),
+        _ => format!("{} days ago", d / 86400),
+    })
+}
 static NOTIFY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 pub fn state() -> State {
@@ -191,6 +214,7 @@ fn fetch_latest() -> Result<Release, String> {
     let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "unexpected reply from GitHub")?;
     let tag = v["tag_name"].as_str().ok_or("release has no tag")?.to_string();
     let page = v["html_url"].as_str().unwrap_or("").to_string();
+    let notes = v["body"].as_str().unwrap_or("").to_string();
     let mut exe_url = None;
     let mut sha_url = None;
     if let Some(assets) = v["assets"].as_array() {
@@ -209,6 +233,7 @@ fn fetch_latest() -> Result<Release, String> {
         exe_url: exe_url.ok_or("release has no Switch.exe asset")?,
         sha_url,
         page,
+        notes,
     })
 }
 
@@ -222,8 +247,14 @@ pub fn check_async(quiet: bool) {
         set_state(State::Checking, 0);
     }
     std::thread::spawn(move || match fetch_latest() {
-        Ok(rel) if is_newer(&rel.version, VERSION) => set_state(State::Available(rel), 1),
-        Ok(_) => set_state(State::UpToDate, 0),
+        Ok(rel) if is_newer(&rel.version, VERSION) => {
+            LAST_CHECK.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+            set_state(State::Available(rel), 1)
+        }
+        Ok(_) => {
+            LAST_CHECK.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+            set_state(State::UpToDate, 0)
+        }
         Err(e) => {
             util::log(&format!("update check failed: {e}"));
             if quiet {
@@ -324,4 +355,17 @@ mod tests {
         assert!(!is_newer("0.1.0-beta", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
     }
+}
+
+/// Plain-text lines from markdown release notes, for display.
+pub fn notes_lines(md: &str, max: usize) -> Vec<String> {
+    md.lines()
+        .map(|l| {
+            let t = l.trim().trim_start_matches('#').trim();
+            let t = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).map(|r| format!("\u{2022} {r}")).unwrap_or_else(|| t.to_string());
+            t.replace("**", "").replace('`', "")
+        })
+        .filter(|l| !l.is_empty() && !l.starts_with("<!--"))
+        .take(max)
+        .collect()
 }

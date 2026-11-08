@@ -56,6 +56,11 @@ impl Gfx {
     }
 
     pub fn text_format(&self, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
+        self.text_format_ex(size, weight, align, false)
+    }
+
+    /// `wrap`: multi-line, top-aligned (for paragraphs such as release notes).
+    pub fn text_format_ex(&self, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT, wrap: bool) -> Result<IDWriteTextFormat> {
         unsafe {
             let locale = wide("en-us");
             let f = self.dw.CreateTextFormat(
@@ -67,9 +72,14 @@ impl Gfx {
                 size,
                 PCWSTR(locale.as_ptr()),
             )?;
+            f.SetTextAlignment(align)?;
+            if wrap {
+                f.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+                f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+                return Ok(f);
+            }
             f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            f.SetTextAlignment(align)?;
             let sign = self.dw.CreateEllipsisTrimmingSign(&f)?;
             let trimming = DWRITE_TRIMMING {
                 granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
@@ -263,7 +273,7 @@ pub fn parse_hex(s: &str) -> Option<u32> {
 pub fn palette(c: &Config) -> Palette {
     let dark = match c.theme {
         Theme::System => system_dark(),
-        Theme::Dark => true,
+        Theme::Dark | Theme::Black => true,
         Theme::Light => false,
     };
     let accent_rgb = if c.accent == "system" {
@@ -280,6 +290,21 @@ pub fn palette(c: &Config) -> Palette {
         accent = accent.mix(C::hex(0x000000), 0.3);
     }
     let on_accent = if accent.luminance() > 0.6 { C::hex(0x111114) } else { C::hex(0xFFFFFF) };
+    if c.theme == Theme::Black {
+        return Palette {
+            dark,
+            bg: C::hex(0x000000),
+            surface: C::hex(0x111114),
+            surface_hover: C::hex(0x1D1D22),
+            border: C::hex(0xFFFFFF).a(0.10),
+            text: C::hex(0xF4F4F6),
+            subtext: C::hex(0x9C9CA6),
+            faint: C::hex(0x66666F),
+            accent,
+            on_accent,
+            thumb_bg: C::hex(0x0B0B0D),
+        };
+    }
     if dark {
         Palette {
             dark,
@@ -316,6 +341,8 @@ pub fn palette(c: &Config) -> Palette {
 pub struct Painter<'a> {
     pub rt: &'a ID2D1RenderTarget,
     pub brush: &'a ID2D1SolidColorBrush,
+    /// Second brush, used for highlighted text runs.
+    pub brush2: &'a ID2D1SolidColorBrush,
     /// Global opacity multiplier (fade-in).
     pub alpha: f32,
 }
@@ -385,6 +412,34 @@ impl<'a> Painter<'a> {
             );
         }
     }
+    /// Text with some UTF-16 ranges drawn bold in `hl` (search matches).
+    pub fn text_hl(&self, s: &str, fmt: &IDWriteTextFormat, r: R, c: C, ranges: &[(u32, u32)], hl: C) {
+        if ranges.is_empty() {
+            return self.text(s, fmt, r, c);
+        }
+        if s.is_empty() || r.w <= 1.0 {
+            return;
+        }
+        let t = utf16(s);
+        unsafe {
+            let Ok(layout) = gfx().dw.CreateTextLayout(&t, fmt, r.w, r.h) else { return };
+            self.brush2.SetColor(&hl.a(self.alpha).d2d());
+            let effect: windows::core::IUnknown = self.brush2.cast().unwrap();
+            for &(start, len) in ranges {
+                let range = DWRITE_TEXT_RANGE { startPosition: start, length: len };
+                let _ = layout.SetDrawingEffect(&effect, range);
+                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
+            }
+            self.set(c);
+            self.rt.DrawTextLayout(
+                D2D_POINT_2F { x: r.x, y: r.y },
+                &layout,
+                self.brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            );
+        }
+    }
+
     pub fn bitmap(&self, b: &ID2D1Bitmap, r: R, opacity: f32) {
         unsafe {
             self.rt.DrawBitmap(
@@ -419,6 +474,12 @@ impl<'a> Painter<'a> {
     pub fn glyph_search(&self, cx: f32, cy: f32, s: f32, c: C, w: f32) {
         self.ring(cx - s * 0.2, cy - s * 0.2, s * 0.65, c, w);
         self.line(cx + s * 0.28, cy + s * 0.28, cx + s * 0.85, cy + s * 0.85, c, w);
+    }
+    pub fn glyph_desktop(&self, cx: f32, cy: f32, s: f32, c: C, w: f32) {
+        // Two stacked squares: "another desktop".
+        self.stroke(R::new(cx - s, cy - s * 0.4, s * 1.3, s * 1.3), s * 0.2, c, w);
+        self.line(cx - s * 0.6, cy - s * 0.85, cx + s * 0.75, cy - s * 0.85, c, w);
+        self.line(cx + s * 0.75, cy - s * 0.85, cx + s * 0.75, cy + s * 0.5, c, w);
     }
     pub fn glyph_check(&self, cx: f32, cy: f32, s: f32, c: C, w: f32) {
         self.line(cx - s, cy, cx - s * 0.3, cy + s * 0.7, c, w);

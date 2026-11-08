@@ -1,6 +1,6 @@
 [package]
 name = "switch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A fast, modern Alt-Tab replacement for Windows"
 license = "MIT"
@@ -33,7 +33,10 @@ features = [
   "Win32_Networking_WinHttp",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
+  "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_ProcessStatus",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

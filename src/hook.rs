@@ -22,6 +22,11 @@ pub const WM_SW_KEY: u32 = WM_APP + 14;
 
 pub const OPEN_REVERSE: usize = 1;
 pub const OPEN_STICKY: usize = 2;
+/// Only windows of the foreground app (Alt+`).
+pub const OPEN_SAME_APP: usize = 4;
+
+/// Scan code of the key above Tab (` on US layouts), layout independent.
+const SC_BACKTICK: u32 = 0x29;
 
 pub const KEY_SHIFT: isize = 1 << 16;
 pub const KEY_CTRL: isize = 1 << 17;
@@ -31,6 +36,11 @@ pub const MAGIC: usize = 0x5357_4954;
 
 pub static UI_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static ALT_TAB: AtomicBool = AtomicBool::new(true);
+pub static ALT_BACKTICK: AtomicBool = AtomicBool::new(true);
+/// Releasing Alt switches; when false Alt+Tab sessions are always sticky.
+pub static RELEASE_TO_SWITCH: AtomicBool = AtomicBool::new(true);
+/// A context menu is open over the switcher; let keys reach it.
+pub static PASSTHRU: AtomicBool = AtomicBool::new(false);
 /// Packed custom hotkey (see `Hotkey::pack`), 0 = none.
 pub static HOTKEY: AtomicU32 = AtomicU32::new(0);
 /// A switcher session is open (keys are being routed to it).
@@ -125,7 +135,7 @@ unsafe extern "system" fn kb_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         return CallNextHookEx(HHOOK::default(), code, w, l);
     }
     let k = &*(l.0 as *const KBDLLHOOKSTRUCT);
-    if k.dwExtraInfo == MAGIC || PAUSED.load(Relaxed) || RECORDING.load(Relaxed) {
+    if k.dwExtraInfo == MAGIC || PAUSED.load(Relaxed) || RECORDING.load(Relaxed) || PASSTHRU.load(Relaxed) {
         return CallNextHookEx(HHOOK::default(), code, w, l);
     }
     let msg = w.0 as u32;
@@ -148,12 +158,35 @@ unsafe extern "system" fn kb_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if vk == VK_TAB.0 as u32 && alt && !win && ALT_TAB.load(Relaxed) {
         if is_down {
             if !active {
-                begin_session(ctrl);
+                let sticky = ctrl || !RELEASE_TO_SWITCH.load(Relaxed);
+                begin_session(sticky);
                 let mut f = 0;
                 if shift {
                     f |= OPEN_REVERSE;
                 }
-                if ctrl {
+                if sticky {
+                    f |= OPEN_STICKY;
+                }
+                inject_dummy();
+                post(WM_SW_OPEN, f, 0);
+            } else {
+                post(if shift { WM_SW_PREV } else { WM_SW_NEXT }, 0, 0);
+            }
+        }
+        return LRESULT(1);
+    }
+
+    // Alt+` : windows of the current app.
+    if k.scanCode == SC_BACKTICK && alt && !win && !ctrl && ALT_BACKTICK.load(Relaxed) {
+        if is_down {
+            if !active {
+                let sticky = !RELEASE_TO_SWITCH.load(Relaxed);
+                begin_session(sticky);
+                let mut f = OPEN_SAME_APP;
+                if shift {
+                    f |= OPEN_REVERSE;
+                }
+                if sticky {
                     f |= OPEN_STICKY;
                 }
                 inject_dummy();
@@ -236,6 +269,8 @@ pub fn start() {
 
 pub fn apply_config(c: &crate::config::Config) {
     ALT_TAB.store(c.alt_tab, Relaxed);
+    ALT_BACKTICK.store(c.alt_backtick, Relaxed);
+    RELEASE_TO_SWITCH.store(c.release_to_switch, Relaxed);
     HOTKEY.store(c.hotkey.map(|h| h.pack()).unwrap_or(0), Relaxed);
 }
 
