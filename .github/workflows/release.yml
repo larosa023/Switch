@@ -30,9 +30,23 @@ jobs:
           $hash = (Get-FileHash Switch.exe -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path Switch.exe.sha256 -Value "$hash  Switch.exe" -NoNewline -Encoding ascii
 
+      # Release notes come from this version's section of CHANGELOG.md, and the
+      # built-in updater shows them in Settings -> Updates.
+      - name: Release notes
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          $out = @(); $on = $false
+          foreach ($l in Get-Content CHANGELOG.md) {
+            if ($l -match '^## ') { if ($on) { break }; $on = ($l.Trim() -eq "## $v"); continue }
+            if ($on) { $out += $l }
+          }
+          if ($out.Count -eq 0) { $out = @("Switch $v") }
+          Set-Content -Path notes.md -Value ($out -join "`n").Trim() -Encoding utf8
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             Switch.exe
             Switch.exe.sha256
-          generate_release_notes: true
+          body_path: notes.md
