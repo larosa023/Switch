@@ -35,6 +35,8 @@ choice!(Position { Center, Top, Bottom });
 choice!(TextSize { Small, Default, Large });
 choice!(AnimSpeed { Off, Fast, Normal, Relaxed });
 choice!(TrayClick { Settings, Switcher });
+choice!(Corner { Off, TopLeft, TopRight, BottomLeft, BottomRight });
+choice!(MouseButton { Off, Back, Forward });
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Hotkey {
@@ -67,6 +69,12 @@ pub struct Config {
     pub alt_backtick: bool,
     /// Optional extra shortcut that opens the switcher.
     pub hotkey: Option<Hotkey>,
+    /// Digits 1-9 jump straight to a window (while the search is empty).
+    pub number_keys: bool,
+    /// Hover the cursor in a screen corner to open the switcher.
+    pub hot_corner: Corner,
+    /// A mouse button that opens the switcher.
+    pub mouse_button: MouseButton,
     /// Delay before the switcher becomes visible, so a quick Alt+Tab tap
     /// flips windows without flashing the UI.
     pub show_delay_ms: u32,
@@ -108,6 +116,11 @@ pub struct Config {
     pub action_buttons: bool,
     /// Lower-case executable names, e.g. "spotify.exe".
     pub hidden_apps: Vec<String>,
+    /// Favorite apps (lower-case exe names), listed first when `favorites_first`.
+    pub favorites: Vec<String>,
+    pub favorites_first: bool,
+    /// Typing also finds apps from the Start menu to launch.
+    pub launcher: bool,
 
     // ---- General
     pub tray_click: TrayClick,
@@ -117,6 +130,8 @@ pub struct Config {
     pub auto_update: bool,
     pub notify_updates: bool,
     pub auto_install: bool,
+    /// Also offer pre-release (beta) versions.
+    pub prerelease: bool,
 
     // ---- v0.1 fields, read once for migration and never written back.
     #[serde(skip_serializing)]
@@ -134,6 +149,9 @@ impl Default for Config {
             release_to_switch: true,
             alt_backtick: true,
             hotkey: None,
+            number_keys: true,
+            hot_corner: Corner::Off,
+            mouse_button: MouseButton::Off,
             show_delay_ms: 40,
             theme: Theme::System,
             accent: "system".into(),
@@ -162,11 +180,15 @@ impl Default for Config {
             hover_select: false,
             action_buttons: true,
             hidden_apps: Vec::new(),
+            favorites: Vec::new(),
+            favorites_first: true,
+            launcher: true,
             tray_click: TrayClick::Settings,
             trim_memory: true,
             auto_update: true,
             notify_updates: true,
             auto_install: false,
+            prerelease: false,
             animations: None,
             group_by_app: None,
             preview_size: None,
@@ -255,6 +277,13 @@ pub fn save() {
     }
 }
 
+/// Parse a settings file (from Export), applying the same migration as load.
+pub fn import_from_str(text: &str) -> Option<Config> {
+    let mut c: Config = serde_json::from_str(text).ok()?;
+    c.migrate();
+    Some(c)
+}
+
 pub fn reset() {
     *cfg() = Config::default();
     save();
@@ -272,6 +301,56 @@ fn run_command() -> String {
 
 pub fn autostart_enabled() -> bool {
     util::reg_get_string(HKEY_CURRENT_USER, RUN_KEY, RUN_NAME).is_some()
+}
+
+// ---- Start with Windows as administrator (Task Scheduler) --------------------
+//
+// A logon task with "highest privileges" starts Switch elevated without a UAC
+// prompt, so Alt+Tab also works over elevated windows. Creating or removing
+// the task itself needs one UAC prompt.
+
+const TASK_NAME: &str = "Switch (larosa023)";
+
+pub fn admin_task_exists() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("schtasks.exe")
+        .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Create or delete the elevated logon task (asks for UAC once).
+/// Returns false if the user declined.
+pub fn set_admin_task(on: bool) -> bool {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let args = if on {
+        format!(
+            "/Create /F /TN \"{TASK_NAME}\" /SC ONLOGON /RL HIGHEST /DELAY 0000:05 /TR \"\\\"{}\\\" --background\"",
+            exe.display()
+        )
+    } else {
+        format!("/Delete /F /TN \"{TASK_NAME}\"")
+    };
+    let ok = util::run_elevated_wait("schtasks.exe", &args);
+    if ok && on {
+        // The task replaces the normal Run entry.
+        set_autostart(false);
+    }
+    ok
+}
+
+pub fn autostart_mode() -> usize {
+    if admin_task_exists() {
+        2
+    } else if autostart_enabled() {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn set_autostart(on: bool) {

@@ -98,8 +98,17 @@ pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((it.next()??, it.next().flatten().unwrap_or(0), it.next().flatten().unwrap_or(0)))
 }
 
+/// Sort key: (major, minor, patch, is_stable, pre-release tag). A stable
+/// release sorts above its own betas ("0.4.0" > "0.4.0-beta.2").
+pub fn version_key(s: &str) -> Option<(u64, u64, u64, bool, String)> {
+    let (a, b, c) = parse_version(s)?;
+    let t = s.trim().trim_start_matches(['v', 'V']);
+    let pre = t.split_once('-').map(|(_, p)| p.split('+').next().unwrap_or("").to_string());
+    Some((a, b, c, pre.is_none(), pre.unwrap_or_default()))
+}
+
 pub fn is_newer(remote: &str, local: &str) -> bool {
-    match (parse_version(remote), parse_version(local)) {
+    match (version_key(remote), version_key(local)) {
         (Some(r), Some(l)) => r > l,
         _ => false,
     }
@@ -208,10 +217,21 @@ pub fn http_get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, St
 
 // ---- Check / install ----------------------------------------------------------
 
-fn fetch_latest() -> Result<Release, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = http_get(&url, "application/vnd.github+json", 4 * 1024 * 1024)?;
-    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "unexpected reply from GitHub")?;
+fn fetch_latest(prerelease: bool) -> Result<Release, String> {
+    let v: serde_json::Value = if prerelease {
+        // /releases/latest skips pre-releases, so pick the newest from the list.
+        let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=15");
+        let body = http_get(&url, "application/vnd.github+json", 8 * 1024 * 1024)?;
+        let list: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(|_| "unexpected reply from GitHub")?;
+        list.into_iter()
+            .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+            .max_by_key(|r| version_key(r["tag_name"].as_str().unwrap_or("")))
+            .ok_or("no published release found")?
+    } else {
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let body = http_get(&url, "application/vnd.github+json", 4 * 1024 * 1024)?;
+        serde_json::from_slice(&body).map_err(|_| "unexpected reply from GitHub")?
+    };
     let tag = v["tag_name"].as_str().ok_or("release has no tag")?.to_string();
     let page = v["html_url"].as_str().unwrap_or("").to_string();
     let notes = v["body"].as_str().unwrap_or("").to_string();
@@ -239,14 +259,14 @@ fn fetch_latest() -> Result<Release, String> {
 
 /// Check in the background. `quiet` checks don't overwrite the state with
 /// errors (so an offline laptop doesn't nag).
-pub fn check_async(quiet: bool) {
+pub fn check_async(quiet: bool, prerelease: bool) {
     if matches!(state(), State::Checking | State::Downloading(_)) {
         return;
     }
     if !quiet {
         set_state(State::Checking, 0);
     }
-    std::thread::spawn(move || match fetch_latest() {
+    std::thread::spawn(move || match fetch_latest(prerelease) {
         Ok(rel) if is_newer(&rel.version, VERSION) => {
             LAST_CHECK.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
             set_state(State::Available(rel), 1)
@@ -354,6 +374,9 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0-beta", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+        assert!(is_newer("0.4.0", "0.4.0-beta.2"));
+        assert!(is_newer("0.4.0-beta.2", "0.4.0-beta.1"));
+        assert!(is_newer("0.4.0-beta.1", "0.3.0"));
     }
 }
 

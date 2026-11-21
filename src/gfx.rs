@@ -148,6 +148,23 @@ impl Gfx {
             rt.CreateBitmapFromWicBitmap(&conv, None).ok()
         }
     }
+
+    pub fn hbitmap_bitmap(&self, rt: &ID2D1RenderTarget, hbm: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<ID2D1Bitmap> {
+        unsafe {
+            let src = self.wic.CreateBitmapFromHBITMAP(hbm, None, WICBitmapUseAlpha).ok()?;
+            let conv = self.wic.CreateFormatConverter().ok()?;
+            conv.Initialize(
+                &src,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeMedianCut,
+            )
+            .ok()?;
+            rt.CreateBitmapFromWicBitmap(&conv, None).ok()
+        }
+    }
 }
 
 // ---- Geometry ---------------------------------------------------------------

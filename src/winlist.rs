@@ -32,11 +32,16 @@ pub struct WinInfo {
     pub maximized: bool,
     /// Lives on another virtual desktop.
     pub other_desktop: bool,
+    /// Not a window: an installed app offered as a search result.
+    pub launch: Option<crate::apps::AppEntry>,
 }
 
 #[derive(Default)]
 struct Caches {
     app_names: HashMap<String, String>,
+    /// hwnd -> (pid, exe path). Resolving a process path means opening the
+    /// process, so it's done once per window, not on every Alt+Tab.
+    paths: HashMap<isize, (u32, String)>,
 }
 static CACHES: UiCell<Caches> = UiCell::new();
 
@@ -263,6 +268,7 @@ pub fn enumerate(allow_other_desktops: bool) -> Vec<WinInfo> {
     let handles = ctx.handles;
     let own_pid = std::process::id();
     let mut out = Vec::with_capacity(handles.len());
+    let mut seen: Vec<isize> = Vec::with_capacity(handles.len());
     for (h, other_desktop) in handles {
         unsafe {
             let mut pid = 0u32;
@@ -270,14 +276,28 @@ pub fn enumerate(allow_other_desktops: bool) -> Vec<WinInfo> {
             if pid == own_pid {
                 continue;
             }
-            let mut path = process_path(pid).unwrap_or_default();
-            if path.to_lowercase().ends_with("applicationframehost.exe") {
-                if let Some(child) = uwp_child_pid(h, pid) {
-                    if let Some(p) = process_path(child) {
-                        path = p;
+            let key = h.0 as isize;
+            seen.push(key);
+            let cached = caches().paths.get(&key).filter(|(p, _)| *p == pid).map(|(_, path)| path.clone());
+            let path = match cached {
+                Some(p) => p,
+                None => {
+                    let mut path = process_path(pid).unwrap_or_default();
+                    let uwp_host = path.to_lowercase().ends_with("applicationframehost.exe");
+                    if uwp_host {
+                        if let Some(child) = uwp_child_pid(h, pid) {
+                            if let Some(p) = process_path(child) {
+                                path = p;
+                            }
+                        }
                     }
+                    // A UWP frame can be created before its app process is attached; don't cache that.
+                    if !path.is_empty() && !(uwp_host && path.to_lowercase().ends_with("applicationframehost.exe")) {
+                        caches().paths.insert(key, (pid, path.clone()));
+                    }
+                    path
                 }
-            }
+            };
             let exe = path.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase();
             let len = GetWindowTextLengthW(h);
             let mut buf = vec![0u16; len as usize + 1];
@@ -302,9 +322,11 @@ pub fn enumerate(allow_other_desktops: bool) -> Vec<WinInfo> {
                 aspect: aspect_of(h, minimized),
                 maximized: IsZoomed(h).as_bool(),
                 other_desktop,
+                launch: None,
             });
         }
     }
+    caches().paths.retain(|k, _| seen.contains(k));
     out
 }
 
@@ -495,5 +517,40 @@ pub fn open_location(w: &WinInfo) {
 pub fn new_window(w: &WinInfo) {
     if !w.exe_path.is_empty() {
         util::shell_open(&w.exe_path);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Snap {
+    Left,
+    Right,
+}
+
+/// Snap a window to the left or right half of its monitor's work area,
+/// compensating for the invisible resize borders Windows 10/11 add.
+pub fn snap(h: isize, side: Snap, on: Option<HMONITOR>) {
+    unsafe {
+        let hw = util::hwnd(h);
+        if IsIconic(hw).as_bool() || IsZoomed(hw).as_bool() {
+            let _ = ShowWindow(hw, SW_RESTORE);
+        }
+        let work = monitor_work_area(on.unwrap_or_else(|| MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST)));
+        let half = (work.right - work.left) / 2;
+        let (x, w) = match side {
+            Snap::Left => (work.left, half),
+            Snap::Right => (work.left + half, (work.right - work.left) - half),
+        };
+        let (y, hh) = (work.top, work.bottom - work.top);
+        let mut wr = RECT::default();
+        let mut fr = RECT::default();
+        let _ = GetWindowRect(hw, &mut wr);
+        let (mut dl, mut dt, mut dr, mut db) = (0, 0, 0, 0);
+        if DwmGetWindowAttribute(hw, DWMWA_EXTENDED_FRAME_BOUNDS, &mut fr as *mut RECT as *mut _, std::mem::size_of::<RECT>() as u32).is_ok() {
+            dl = fr.left - wr.left;
+            dt = fr.top - wr.top;
+            dr = wr.right - fr.right;
+            db = wr.bottom - fr.bottom;
+        }
+        let _ = SetWindowPos(hw, HWND::default(), x - dl, y - dt, w + dl + dr, hh + dt + db, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }

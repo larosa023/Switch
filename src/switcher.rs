@@ -54,6 +54,10 @@ enum Act {
     OpenLocation,
     NewWindow,
     HideApp,
+    SnapLeft,
+    SnapRight,
+    SideBySide,
+    Favorite,
 }
 
 #[derive(Clone, Default)]
@@ -134,7 +138,16 @@ pub struct Switcher {
     animating: bool,
     /// Foreground window to give focus back to after a context menu.
     restore_fg: Option<isize>,
+    /// Real windows in `all`; entries after this are app-launch results.
+    n_real: usize,
+    /// The window that was active when the switcher opened.
+    fg_hwnd: isize,
+    app_icons: HashMap<String, Option<ID2D1Bitmap>>,
+    open_cost: std::time::Duration,
 }
+
+/// How long the last open took (enumerate + layout + first frame), in microseconds.
+pub static LAST_OPEN_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 static SW: UiCell<Switcher> = UiCell::new();
 fn sw() -> &'static mut Switcher {
@@ -241,6 +254,10 @@ pub fn create() -> Result<HWND> {
             t_last: now,
             animating: false,
             restore_fg: None,
+            n_real: 0,
+            fg_hwnd: 0,
+            app_icons: HashMap::new(),
+            open_cost: std::time::Duration::ZERO,
         });
         // Warm up Direct2D so the first Alt+Tab is instant.
         sw().ensure_target();
@@ -351,7 +368,16 @@ impl Switcher {
                 self.same_app = Some(exe);
             }
 
+            // The window to start on, by identity (MRU order), so favorites,
+            // sorting and grouping never change what Alt+Tab flips to.
+            let target = if c.initial == Initial::Previous && fg_first {
+                all.get(1).or(all.first()).map(|w| w.hwnd)
+            } else {
+                all.first().map(|w| w.hwnd)
+            };
+            self.fg_hwnd = fg.0 as isize;
             self.all = all;
+            self.n_real = self.all.len();
             let live: std::collections::HashSet<isize> = self.all.iter().map(|w| w.hwnd).collect();
             self.icons.retain(|k, _| live.contains(k));
 
@@ -362,12 +388,14 @@ impl Switcher {
                 0
             } else if flags & OPEN_REVERSE != 0 {
                 n - 1
-            } else if fg_first && n > 1 && c.initial == Initial::Previous {
-                1
             } else {
-                0
+                target.and_then(|h| self.item_for(h)).unwrap_or(0)
             };
             self.place_items();
+            self.open_cost = self.t_session.elapsed();
+            if self.app_icons.len() > 200 {
+                self.app_icons.clear();
+            }
 
             let delay = c.show_delay_ms;
             if delay == 0 || flags & OPEN_STICKY != 0 {
@@ -376,6 +404,19 @@ impl Switcher {
                 SetTimer(self.hwnd, TIMER_SHOW, delay, None);
             }
         }
+    }
+
+    /// Item showing window `h` (or its app's tile when collapsed).
+    fn item_for(&self, h: isize) -> Option<usize> {
+        if let Some(i) = self.items.iter().position(|it| self.all[it.win].hwnd == h) {
+            return Some(i);
+        }
+        let exe = &self.all.iter().find(|w| w.hwnd == h)?.exe;
+        self.items.iter().position(|it| &self.all[it.win].exe == exe)
+    }
+
+    fn is_launch(&self, it: &Item) -> bool {
+        self.all[it.win].launch.is_some()
     }
 
     fn panel_origin(&self) -> (i32, i32) {
@@ -435,9 +476,12 @@ impl Switcher {
             if let Some(it) = self.items.get(self.sel) {
                 self.hl = it.tile;
             }
+            let t0 = Instant::now();
             self.render();
             self.update_thumbs();
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            let us = (self.open_cost + t0.elapsed()).as_micros().min(u32::MAX as u128) as u32;
+            LAST_OPEN_US.store(us, std::sync::atomic::Ordering::Relaxed);
             self.kick();
         }
     }
@@ -483,13 +527,17 @@ impl Switcher {
         if !self.session {
             return;
         }
-        let target = self.items.get(self.sel).map(|it| self.all[it.win].hwnd);
+        let target = self.items.get(self.sel).map(|it| self.all[it.win].clone());
         if target.is_some() {
             self.restore_fg = None;
         }
         self.close();
-        if let Some(h) = target {
-            winlist::activate(h);
+        match target {
+            Some(w) => match &w.launch {
+                Some(app) => crate::apps::launch(app),
+                None => winlist::activate(w.hwnd),
+            },
+            None => {}
         }
     }
 
@@ -497,6 +545,31 @@ impl Switcher {
 
     fn rebuild(&mut self) {
         let q = self.query.trim().to_string();
+        // Drop the previous search's app results, then add fresh ones.
+        self.all.truncate(self.n_real);
+        if !q.is_empty() && cfg().launcher && self.same_app.is_none() {
+            let max = if self.layout == Layout::List { 6 } else { 4 };
+            for (k, (_, _, app)) in crate::apps::search(&q, max).into_iter().enumerate() {
+                // Skip apps that already have a window in the results.
+                if self.all[..self.n_real].iter().any(|w| w.app_name.eq_ignore_ascii_case(&app.name)) {
+                    continue;
+                }
+                self.all.push(WinInfo {
+                    hwnd: -(k as isize) - 1,
+                    title: app.name.clone(),
+                    exe: String::new(),
+                    exe_path: String::new(),
+                    app_name: "App".into(),
+                    monitor: 0,
+                    minimized: false,
+                    topmost: false,
+                    aspect: 1.25,
+                    maximized: false,
+                    other_desktop: false,
+                    launch: Some(app),
+                });
+            }
+        }
         let mut picked: Vec<(usize, i32, Vec<(u32, u32)>)> = Vec::new();
         for (i, w) in self.all.iter().enumerate() {
             if q.is_empty() {
@@ -511,8 +584,14 @@ impl Switcher {
                 Sort::App => picked.sort_by_key(|p| self.all[p.0].app_name.to_lowercase()),
                 Sort::Title => picked.sort_by_key(|p| self.all[p.0].title.to_lowercase()),
             }
+            let favs = &cfg().favorites;
+            if cfg().favorites_first && !favs.is_empty() {
+                picked.sort_by_key(|p| !favs.contains(&self.all[p.0].exe));
+            }
         } else {
-            picked.sort_by(|a, b| b.1.cmp(&a.1)); // stable: MRU order within equal scores
+            // Windows first (ranked by match), then apps to launch.
+            let n_real = self.n_real;
+            picked.sort_by(|a, b| (a.0 >= n_real).cmp(&(b.0 >= n_real)).then(b.1.cmp(&a.1)));
         }
         let mut items: Vec<Item> = picked
             .into_iter()
@@ -523,7 +602,8 @@ impl Switcher {
             Grouping::Cluster | Grouping::Collapse => {
                 let mut groups: Vec<(String, Vec<Item>)> = Vec::new();
                 for it in items {
-                    let key = self.all[it.win].exe.clone();
+                    let w = &self.all[it.win];
+                    let key = if w.launch.is_some() { format!("launch:{}", w.title) } else { w.exe.clone() };
                     match groups.iter_mut().find(|(k, _)| *k == key) {
                         Some((_, v)) => v.push(it),
                         None => groups.push((key, vec![it])),
@@ -569,9 +649,15 @@ impl Switcher {
     }
 
     fn group_break(&self, i: usize) -> bool {
-        self.grouping == Grouping::Cluster
-            && i > 0
-            && self.all[self.items[i].win].exe != self.all[self.items[i - 1].win].exe
+        if i == 0 {
+            return false;
+        }
+        let (a, b) = (&self.all[self.items[i].win], &self.all[self.items[i - 1].win]);
+        // Always set app results apart from windows.
+        if a.launch.is_some() != b.launch.is_some() {
+            return true;
+        }
+        self.grouping == Grouping::Cluster && a.launch.is_none() && a.exe != b.exe
     }
 
     /// Greedy row packing. Returns rows of item indices and the widest row.
@@ -706,8 +792,9 @@ impl Switcher {
             let y = c.y + (i - self.list_first) as f32 * m.row_h;
             it.visible = true;
             it.tile = R::new(c.x, y, list_w, m.row_h);
-            it.icon = R::new(c.x + 12.0 * s, y + (m.row_h - icon_s) / 2.0, icon_s, icon_s);
-            it.title = R::new(it.icon.right() + 12.0 * s, y, list_w - icon_s - 36.0 * s, m.row_h);
+            let badge = if cfg().number_keys && i < 9 { 24.0 * s } else { 0.0 };
+            it.icon = R::new(c.x + 12.0 * s + badge, y + (m.row_h - icon_s) / 2.0, icon_s, icon_s);
+            it.title = R::new(it.icon.right() + 12.0 * s, y, list_w - icon_s - 36.0 * s - badge, m.row_h);
             it.thumb_area = R::default();
             for (bi, r) in it.btns.iter_mut().enumerate() {
                 let from_right = (3 - bi) as f32;
@@ -750,12 +837,13 @@ impl Switcher {
                 }
                 let tw = widths[k];
                 let icon_s = 18.0 * s;
+                let badge = if cfg().number_keys && i < 9 { 22.0 * s } else { 0.0 };
                 let it = &mut self.items[i];
                 it.visible = true;
                 it.row = ri;
                 it.tile = R::new(x, y, tw, tile_h);
                 it.title = R::new(x + m.tile_pad, y + m.tile_pad, tw - 2.0 * m.tile_pad, m.title_h);
-                it.icon = R::new(it.title.x + 2.0 * s, it.title.y + (m.title_h - icon_s) / 2.0, icon_s, icon_s);
+                it.icon = R::new(it.title.x + 2.0 * s + badge, it.title.y + (m.title_h - icon_s) / 2.0, icon_s, icon_s);
                 it.thumb_area = R::new(x + m.tile_pad, it.title.bottom() + m.title_gap, tw - 2.0 * m.tile_pad, h);
                 let b = 22.0 * s;
                 for (bi, r) in it.btns.iter_mut().enumerate() {
@@ -844,6 +932,9 @@ impl Switcher {
         let opacity = (self.fade.clamp(0.0, 1.0) * 255.0) as u8;
         unsafe {
             for w in &self.all {
+                if w.launch.is_some() {
+                    continue;
+                }
                 let area = shown.get(&w.hwnd);
                 let thumb = match (self.thumbs.get(&w.hwnd), area) {
                     (Some(&t), _) => t,
@@ -892,6 +983,9 @@ impl Switcher {
         }
         if let Some(pos) = self.all.iter().position(|w| w.hwnd == h) {
             self.all.remove(pos);
+            if pos < self.n_real {
+                self.n_real -= 1;
+            }
         }
     }
 
@@ -1017,6 +1111,9 @@ impl Switcher {
         let Some(it) = self.items.get(idx) else { return };
         let wi = it.win;
         let h = self.all[wi].hwnd;
+        if self.all[wi].launch.is_some() {
+            return; // app results have no window actions
+        }
         match a {
             Act::Close => {
                 // In Collapse mode the tile stands for the whole app.
@@ -1029,7 +1126,8 @@ impl Switcher {
             }
             Act::CloseApp => {
                 let exe = self.all[wi].exe.clone();
-                let gone: Vec<isize> = self.all.iter().filter(|w| w.exe == exe).map(|w| w.hwnd).collect();
+                let gone: Vec<isize> =
+                    self.all.iter().filter(|w| w.exe == exe && w.launch.is_none()).map(|w| w.hwnd).collect();
                 for g in gone {
                     winlist::close(g);
                     self.drop_window(g);
@@ -1077,6 +1175,47 @@ impl Switcher {
                 self.close();
                 winlist::new_window(&w);
             }
+            Act::SnapLeft | Act::SnapRight => {
+                let side = if a == Act::SnapLeft { winlist::Snap::Left } else { winlist::Snap::Right };
+                winlist::snap(h, side, None);
+                self.all[wi].maximized = false;
+                self.all[wi].minimized = false;
+                unsafe {
+                    let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                self.update_thumbs();
+                self.render();
+            }
+            Act::SideBySide => {
+                // The window you came from on the left, the selected one on the right.
+                let cur = self.fg_hwnd;
+                if cur == h || cur == 0 || !self.all.iter().any(|w| w.hwnd == cur) {
+                    return self.act(idx, Act::SnapRight);
+                }
+                let mon = unsafe { MonitorFromWindow(util::hwnd(h), MONITOR_DEFAULTTONEAREST) };
+                winlist::snap(cur, winlist::Snap::Left, Some(mon));
+                winlist::snap(h, winlist::Snap::Right, Some(mon));
+                self.restore_fg = None;
+                self.close();
+                winlist::activate(cur);
+                winlist::activate(h);
+            }
+            Act::Favorite => {
+                let exe = self.all[wi].exe.clone();
+                if exe.is_empty() {
+                    return;
+                }
+                let favs = &mut cfg().favorites;
+                match favs.iter().position(|f| *f == exe) {
+                    Some(p) => {
+                        favs.remove(p);
+                    }
+                    None => favs.push(exe),
+                }
+                config::save();
+                crate::settings_ui::refresh();
+                self.relayout_full();
+            }
             Act::HideApp => {
                 let exe = self.all[wi].exe.clone();
                 if exe.is_empty() {
@@ -1087,7 +1226,8 @@ impl Switcher {
                     config::save();
                     crate::settings_ui::refresh();
                 }
-                let gone: Vec<isize> = self.all.iter().filter(|w| w.exe == exe).map(|w| w.hwnd).collect();
+                let gone: Vec<isize> =
+                    self.all.iter().filter(|w| w.exe == exe && w.launch.is_none()).map(|w| w.hwnd).collect();
                 for g in gone {
                     self.drop_window(g);
                 }
@@ -1110,6 +1250,9 @@ impl Switcher {
         let count = it.count;
         self.sel = idx;
         self.kick();
+        if w.launch.is_some() {
+            return;
+        }
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
@@ -1126,6 +1269,11 @@ impl Switcher {
             add(2, "Minimize\tCtrl+M", MF_STRING);
             add(3, if w.maximized { "Restore\tCtrl+Up" } else { "Maximize\tCtrl+Up" }, MF_STRING);
             add(4, "Pin on top\tCtrl+P", if w.topmost { MF_CHECKED } else { MF_STRING });
+            add(12, "Snap left\tCtrl+Shift+Left", MF_STRING);
+            add(13, "Snap right\tCtrl+Shift+Right", MF_STRING);
+            if self.fg_hwnd != w.hwnd {
+                add(14, "Side by side with current window\tCtrl+S", MF_STRING);
+            }
             if multi_mon {
                 add(5, "Move to next monitor\tCtrl+Right", MF_STRING);
                 add(6, "Move to previous monitor\tCtrl+Left", MF_STRING);
@@ -1133,6 +1281,8 @@ impl Switcher {
             sep();
             add(7, "New window\tCtrl+N", if has_path { MF_STRING } else { MF_GRAYED });
             add(8, "Open file location\tCtrl+O", if has_path { MF_STRING } else { MF_GRAYED });
+            let fav = cfg().favorites.contains(&w.exe);
+            add(15, "Favorite app\tCtrl+F", if fav { MF_CHECKED } else if w.exe.is_empty() { MF_GRAYED } else { MF_STRING });
             add(9, &format!("Hide {} from Switch\tCtrl+H", w.app_name), MF_STRING);
             sep();
             if count <= 1 {
@@ -1164,6 +1314,10 @@ impl Switcher {
                 2 => self.act(idx, Act::Minimize),
                 3 => self.act(idx, Act::Maximize),
                 4 => self.act(idx, Act::Pin),
+                12 => self.act(idx, Act::SnapLeft),
+                13 => self.act(idx, Act::SnapRight),
+                14 => self.act(idx, Act::SideBySide),
+                15 => self.act(idx, Act::Favorite),
                 5 => self.act(idx, Act::MoveNext),
                 6 => self.act(idx, Act::MovePrev),
                 7 => self.act(idx, Act::NewWindow),
@@ -1187,9 +1341,13 @@ impl Switcher {
             let a = match vkk {
                 VK_UP => Some(Act::Maximize),
                 VK_DOWN => Some(Act::Minimize),
+                VK_LEFT if shift => Some(Act::SnapLeft),
+                VK_RIGHT if shift => Some(Act::SnapRight),
                 VK_LEFT => Some(Act::MovePrev),
                 VK_RIGHT => Some(Act::MoveNext),
                 _ => match vk as u8 {
+                    b'S' => Some(Act::SideBySide),
+                    b'F' => Some(Act::Favorite),
                     b'W' if shift => Some(Act::CloseApp),
                     b'W' => Some(Act::Close),
                     b'M' => Some(Act::Minimize),
@@ -1206,10 +1364,15 @@ impl Switcher {
             match vk as u8 {
                 b'G' if self.same_app.is_none() => {
                     self.grouping = Grouping::from_index((self.grouping.index() + 1) % Grouping::ALL.len());
+                    // Remember the choice.
+                    cfg().grouping = self.grouping;
+                    config::save();
                     return self.relayout_full();
                 }
                 b'L' => {
                     self.layout = Layout::from_index((self.layout.index() + 1) % Layout::ALL.len());
+                    cfg().layout = self.layout;
+                    config::save();
                     self.list_first = 0;
                     for (_, t) in self.thumbs.drain() {
                         unsafe {
@@ -1219,6 +1382,21 @@ impl Switcher {
                     return self.relayout_full();
                 }
                 _ => {}
+            }
+        }
+        // 1-9 jump straight to a window while the search is empty.
+        if !ctrl && !shift && cfg().number_keys && self.query.is_empty() {
+            let digit = match vk {
+                0x31..=0x39 => Some(vk - 0x31),
+                0x61..=0x69 => Some(vk - 0x61), // numpad
+                _ => None,
+            };
+            if let Some(d) = digit {
+                if (d as usize) < self.items.len() {
+                    self.sel = d as usize;
+                    self.commit();
+                }
+                return;
             }
         }
         match vkk {
@@ -1283,14 +1461,25 @@ impl Switcher {
     }
 
     fn show_btns(&self, i: usize) -> bool {
-        cfg().action_buttons && (Some(i) == self.hover || i == self.sel)
+        cfg().action_buttons
+            && (Some(i) == self.hover || i == self.sel)
+            && self.items.get(i).map(|it| !self.is_launch(it)).unwrap_or(false)
+    }
+
+    /// Narrow tiles only get the close button, so the title stays readable.
+    fn first_btn(&self, it: &Item) -> usize {
+        if self.layout != Layout::List && it.title.w < 170.0 * self.scale {
+            2
+        } else {
+            0
+        }
     }
 
     fn hit(&self, x: f32, y: f32) -> (Option<usize>, Option<(usize, Btn)>) {
         for (i, it) in self.items.iter().enumerate() {
             if it.visible && it.tile.contains(x, y) {
                 if self.show_btns(i) {
-                    for (bi, r) in it.btns.iter().enumerate() {
+                    for (bi, r) in it.btns.iter().enumerate().skip(self.first_btn(it)) {
                         if r.contains(x, y) {
                             return (Some(i), Some((i, BTNS[bi])));
                         }
@@ -1356,6 +1545,30 @@ impl Switcher {
 
     fn icon_for(&mut self, idx: usize) -> Option<ID2D1Bitmap> {
         let w = &self.all[idx];
+        if let Some(app) = &w.launch {
+            if let Some(b) = self.app_icons.get(&app.target) {
+                return b.clone();
+            }
+            let rt = self.rtb.as_ref()?;
+            let px = (48.0 * self.scale) as i32;
+            let bmp = match crate::apps::icon(app, px) {
+                Some(crate::apps::AppIcon::Bitmap(hb)) => {
+                    let b = gfx().hbitmap_bitmap(rt, hb);
+                    unsafe {
+                        let _ = DeleteObject(hb);
+                    }
+                    b
+                }
+                Some(crate::apps::AppIcon::Icon(hi)) => {
+                    let b = gfx().icon_bitmap(rt, hi);
+                    unsafe { winlist::free_icon(hi, true) };
+                    b
+                }
+                None => None,
+            };
+            self.app_icons.insert(app.target.clone(), bmp.clone());
+            return bmp;
+        }
         if let Some(b) = self.icons.get(&w.hwnd) {
             return b.clone();
         }
@@ -1468,7 +1681,7 @@ impl Switcher {
         p.fill(r, rad, pal.surface);
         p.stroke(r, rad, if self.query.is_empty() { pal.border } else { pal.accent.a(0.6) }, 1.0 * s);
         p.glyph_search(r.x + 20.0 * s, r.y + r.h / 2.0, 8.0 * s, pal.subtext, 1.6 * s);
-        let count = self.items.len();
+        let count = self.items.iter().filter(|it| !self.is_launch(it)).count();
         let noun = if self.grouping == Grouping::Collapse { "app" } else { "window" };
         let mut meta = format!("{} {}{}", count, noun, if count == 1 { "" } else { "s" });
         if self.grouping == Grouping::Cluster {
@@ -1505,6 +1718,9 @@ impl Switcher {
 
     fn label(&self, it: &Item) -> (String, Vec<(u32, u32)>) {
         let w = &self.all[it.win];
+        if w.launch.is_some() {
+            return (w.title.clone(), it.ranges.clone());
+        }
         if it.count > 1 {
             return (w.app_name.clone(), Vec::new());
         }
@@ -1536,7 +1752,7 @@ impl Switcher {
     fn draw_buttons(&self, p: &Painter, pal: &Palette, i: usize, it: &Item) {
         let s = self.scale;
         let w = &self.all[it.win];
-        for (bi, r) in it.btns.iter().enumerate() {
+        for (bi, r) in it.btns.iter().enumerate().skip(self.first_btn(it)) {
             let b = BTNS[bi];
             let hot = self.hover_btn == Some((i, b));
             if hot {
@@ -1562,6 +1778,19 @@ impl Switcher {
         let s = self.scale;
         let w = &self.all[it.win];
         let mut x = right;
+        if w.launch.is_some() {
+            let t = "Open";
+            let bw = gfx().measure(t, &f.badge) + 14.0 * s;
+            let r = R::new(x - bw, cy - 9.0 * s, bw, 18.0 * s);
+            p.stroke(r, 9.0 * s, pal.accent, 1.0 * s);
+            p.text(t, &f.badge, r, pal.accent);
+            return r.x - 6.0 * s;
+        }
+        if !w.exe.is_empty() && cfg().favorites.contains(&w.exe) {
+            let r = R::new(x - 16.0 * s, cy - 9.0 * s, 16.0 * s, 18.0 * s);
+            p.text("\u{2605}", &f.badge, r, pal.accent);
+            x = r.x - 4.0 * s;
+        }
         if it.count > 1 {
             let t = format!("{}", it.count);
             let bw = (gfx().measure(&t, &f.badge) + 12.0 * s).max(20.0 * s);
@@ -1579,6 +1808,18 @@ impl Switcher {
             x -= 22.0 * s;
         }
         x
+    }
+
+    /// "1".."9" badge in front of the first nine windows (number keys).
+    fn draw_number(&self, p: &Painter, f: &Fmts, pal: &Palette, i: usize, it: &Item) {
+        if !cfg().number_keys || i >= 9 || !self.query.is_empty() {
+            return;
+        }
+        let s = self.scale;
+        let r = R::new(it.icon.x - 22.0 * s, it.icon.y + it.icon.h / 2.0 - 8.5 * s, 17.0 * s, 17.0 * s);
+        let sel = i == self.sel;
+        p.fill(r, 4.0 * s, if sel { pal.accent } else { pal.surface_hover });
+        p.text(&(i + 1).to_string(), &f.badge, r, if sel { pal.on_accent } else { pal.subtext });
     }
 
     fn show_btns_for(&self, it: &Item) -> bool {
@@ -1604,19 +1845,20 @@ impl Switcher {
                 big,
                 big,
             );
-            p.bitmap(b, r, 0.5);
+            p.bitmap(b, r, if w.launch.is_some() { 1.0 } else { 0.5 });
         }
+        self.draw_number(p, f, pal, i, it);
         let mut text_right = it.title.right();
         if self.show_btns(i) {
             self.draw_buttons(p, pal, i, it);
-            text_right = it.btns[0].x - 4.0 * s;
+            text_right = it.btns[self.first_btn(it)].x - 4.0 * s;
         }
         text_right = self.draw_marks(p, f, pal, it, text_right, it.title.y + it.title.h / 2.0);
         let tx = if cfg().show_icons {
             self.draw_icon(p, f, pal, it.icon, w, icon);
             it.icon.right() + 8.0 * s
         } else {
-            it.title.x + 4.0 * s
+            it.icon.x + 2.0 * s
         };
         let color = if selected { pal.text } else if w.minimized { pal.faint } else { pal.subtext };
         let (label, ranges) = self.label(it);
@@ -1637,18 +1879,25 @@ impl Switcher {
             right = it.btns[0].x - 6.0 * s;
         }
         right = self.draw_marks(p, f, pal, it, right, it.tile.y + it.tile.h / 2.0);
+        self.draw_number(p, f, pal, i, it);
         let tx = if cfg().show_icons {
             self.draw_icon(p, f, pal, it.icon, w, icon);
             it.title.x
         } else {
-            it.tile.x + 14.0 * s
+            it.icon.x + 2.0 * s
         };
         let tw = (right - tx).max(0.0);
         let mid = it.tile.y + it.tile.h / 2.0;
         let (label, ranges) = self.label(it);
         let color = if selected { pal.text } else if w.minimized { pal.subtext } else { pal.text.mix(pal.subtext, 0.35) };
         p.text_hl(&label, &f.title, R::new(tx, mid - 17.0 * s * cfg().text_scale(), tw, 20.0 * s * cfg().text_scale()), color, &ranges, pal.accent);
-        let mut sub = if it.count > 1 { format!("{} windows", it.count) } else { w.app_name.clone() };
+        let mut sub = if w.launch.is_some() {
+            "App \u{00B7} Enter to open".to_string()
+        } else if it.count > 1 {
+            format!("{} windows", it.count)
+        } else {
+            w.app_name.clone()
+        };
         if w.minimized {
             sub.push_str(" \u{00B7} minimized");
         }

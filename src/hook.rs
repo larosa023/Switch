@@ -258,8 +258,37 @@ pub fn start() {
                 crate::util::log("failed to install keyboard hook");
                 return;
             }
+            HOOK_THREAD.store(GetCurrentThreadId(), Relaxed);
+            let mut mouse: Option<HHOOK> = None;
+            let sync_mouse = |mouse: &mut Option<HHOOK>| {
+                // The mouse hook only exists while a mouse trigger is configured.
+                let want = HOT_CORNER.load(Relaxed) != 0 || MOUSE_BTN.load(Relaxed) != 0;
+                match (want, mouse.is_some()) {
+                    (true, false) => *mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), HINSTANCE(inst.0), 0).ok(),
+                    (false, true) => {
+                        let _ = UnhookWindowsHookEx(mouse.take().unwrap());
+                    }
+                    _ => {}
+                }
+            };
+            sync_mouse(&mut mouse);
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+                if msg.hwnd.is_invalid() && msg.message == WM_HOOK_SYNC {
+                    sync_mouse(&mut mouse);
+                    continue;
+                }
+                if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == CORNER_TIMER.load(Relaxed) {
+                    let _ = KillTimer(HWND::default(), msg.wParam.0);
+                    CORNER_TIMER.store(0, Relaxed);
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    if corner_hit(pt) && !ACTIVE.load(Relaxed) && !PAUSED.load(Relaxed) {
+                        begin_session(true);
+                        post(WM_SW_OPEN, OPEN_STICKY, 0);
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -267,7 +296,94 @@ pub fn start() {
         .expect("spawn hook thread");
 }
 
+// ---- Mouse triggers: hot corner and a mouse button -----------------------------
+
+/// 0 = off, 1..=4 = TopLeft, TopRight, BottomLeft, BottomRight.
+pub static HOT_CORNER: AtomicU32 = AtomicU32::new(0);
+/// 0 = off, 1 = Back (XButton1), 2 = Forward (XButton2).
+pub static MOUSE_BTN: AtomicU32 = AtomicU32::new(0);
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+static CORNER_TIMER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IN_CORNER: AtomicBool = AtomicBool::new(false);
+const WM_HOOK_SYNC: u32 = WM_APP + 50;
+/// How long the cursor has to rest in the corner, so passing through doesn't trigger.
+const CORNER_DWELL_MS: u32 = 300;
+
+/// Is the point within a few pixels of the configured corner of its monitor?
+fn corner_hit(pt: POINT) -> bool {
+    use windows::Win32::Graphics::Gdi::*;
+    let corner = HOT_CORNER.load(Relaxed);
+    if corner == 0 {
+        return false;
+    }
+    unsafe {
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let r = mi.rcMonitor;
+        let t = 3;
+        let left = pt.x <= r.left + t;
+        let right = pt.x >= r.right - 1 - t;
+        let top = pt.y <= r.top + t;
+        let bottom = pt.y >= r.bottom - 1 - t;
+        match corner {
+            1 => left && top,
+            2 => right && top,
+            3 => left && bottom,
+            4 => right && bottom,
+            _ => false,
+        }
+    }
+}
+
+unsafe extern "system" fn mouse_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if code < 0 || PAUSED.load(Relaxed) {
+        return CallNextHookEx(HHOOK::default(), code, w, l);
+    }
+    let m = &*(l.0 as *const MSLLHOOKSTRUCT);
+    let msg = w.0 as u32;
+    if msg == WM_MOUSEMOVE && HOT_CORNER.load(Relaxed) != 0 {
+        let hit = corner_hit(m.pt);
+        if hit && !IN_CORNER.swap(true, Relaxed) && !ACTIVE.load(Relaxed) {
+            let id = SetTimer(HWND::default(), 0, CORNER_DWELL_MS, None);
+            CORNER_TIMER.store(id, Relaxed);
+        } else if !hit && IN_CORNER.swap(false, Relaxed) {
+            let id = CORNER_TIMER.swap(0, Relaxed);
+            if id != 0 {
+                let _ = KillTimer(HWND::default(), id);
+            }
+        }
+    }
+    let btn = MOUSE_BTN.load(Relaxed);
+    if btn != 0 && (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) && m.flags & LLMHF_INJECTED == 0 {
+        let which = (m.mouseData >> 16) & 0xFFFF; // XBUTTON1 = 1, XBUTTON2 = 2
+        if which == btn {
+            if msg == WM_XBUTTONDOWN {
+                if ACTIVE.load(Relaxed) {
+                    // Second press commits, like Enter.
+                    post(WM_SW_KEY, VK_RETURN.0 as usize, 0);
+                } else {
+                    begin_session(true);
+                    post(WM_SW_OPEN, OPEN_STICKY, 0);
+                }
+            }
+            return LRESULT(1);
+        }
+    }
+    CallNextHookEx(HHOOK::default(), code, w, l)
+}
+
 pub fn apply_config(c: &crate::config::Config) {
+    HOT_CORNER.store(c.hot_corner.index() as u32, Relaxed);
+    MOUSE_BTN.store(c.mouse_button.index() as u32, Relaxed);
+    let t = HOOK_THREAD.load(Relaxed);
+    if t != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(t, WM_HOOK_SYNC, WPARAM(0), LPARAM(0));
+        }
+    }
     ALT_TAB.store(c.alt_tab, Relaxed);
     ALT_BACKTICK.store(c.alt_backtick, Relaxed);
     RELEASE_TO_SWITCH.store(c.release_to_switch, Relaxed);

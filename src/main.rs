@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod config;
+mod apps;
 mod fuzzy;
 mod gfx;
 mod hook;
@@ -29,6 +30,7 @@ const WM_SHOW_SETTINGS: u32 = WM_APP + 2;
 const WM_OPEN_SWITCHER: u32 = WM_APP + 3;
 const WM_QUIT_APP: u32 = WM_APP + 4;
 const TIMER_UPDATE: usize = 10;
+const TIMER_APPS: usize = 11;
 
 const ID_OPEN: usize = 100;
 const ID_SETTINGS: usize = 101;
@@ -46,6 +48,7 @@ struct App {
 static APP: UiCell<App> = UiCell::new();
 
 fn main() {
+    util::install_panic_log();
     let args: Vec<String> = std::env::args().collect();
     // --updated: started by the updater; --restart: relaunched (e.g. as admin).
     // Both wait for the previous instance to exit.
@@ -159,6 +162,11 @@ fn main() {
 
         // First update check shortly after start, then every 6 hours.
         SetTimer(main, TIMER_UPDATE, 20_000, None);
+        // App index for launch-from-search: build now (background), refresh hourly.
+        if config::cfg().launcher {
+            apps::refresh_async();
+        }
+        SetTimer(main, TIMER_APPS, 60 * 60 * 1000, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
@@ -308,7 +316,7 @@ fn command(id: usize) {
         ID_UPDATE => match updater::state() {
             State::Available(_) => updater::install_async(),
             _ => {
-                updater::check_async(false);
+                updater::check_async(false, config::cfg().prerelease);
                 settings_ui::show();
             }
         },
@@ -396,6 +404,12 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             on_update_state(l.0);
             LRESULT(0)
         }
+        WM_TIMER if w.0 == TIMER_APPS => {
+            if config::cfg().launcher {
+                apps::refresh_async();
+            }
+            LRESULT(0)
+        }
         WM_TIMER if w.0 == TIMER_UPDATE => {
             if let Some(app) = APP.try_get() {
                 if !app.first_check_done {
@@ -405,7 +419,7 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
             }
             if config::cfg().auto_update {
-                updater::check_async(true);
+                updater::check_async(true, config::cfg().prerelease);
             }
             LRESULT(0)
         }

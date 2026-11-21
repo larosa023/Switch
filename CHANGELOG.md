@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0
+
+**New**
+- Launch apps from search: typing also finds installed apps (desktop and Store apps), shown after matching windows. Press Enter to open one
+- Number keys: press 1–9 to jump straight to a window, with number badges on the first nine
+- Snap from the switcher: Ctrl+Shift+Left / Right puts the window on the left or right half of its screen
+- Side by side: Ctrl+S puts the selected window next to the one you came from
+- Favorite apps: Ctrl+F (or the right-click menu, or Settings → Apps). Their windows lead the list and get a ★
+- Hot corner: rest the cursor in a screen corner to open Switch
+- Mouse button: the Back or Forward side button opens Switch; press it again to switch
+- Start with Windows "As admin": runs elevated at sign-in through Task Scheduler, so Alt+Tab works over admin apps with no prompt each time
+- Beta versions: an opt-in channel for pre-releases
+- Export and import settings (Settings → About)
+
+**Refinements**
+- The window Alt+Tab flips to is chosen by recent use, so favorites, sorting and grouping never change it
+- Ctrl+G and Ctrl+L now remember your choice
+- Narrow tiles show only the close button, so titles stay readable
+- The Apps page (formerly Hidden apps) manages favorites and hidden apps together, with one-click buttons for running apps
+- Updater handles pre-release versions correctly (0.4.0 is newer than 0.4.0-beta.2)
+- The Shortcuts page lists every new key
+
+**Faster and lighter**
+- Process paths are cached per window, so Alt+Tab no longer opens every process on each press
+- The mouse hook only exists while a mouse trigger is turned on
+- Settings → About shows how long the last open took, measured from start to the first frame
+
+**Other**
+- Crashes are written to the log with their location
+- Releases are published automatically when the version changes
+
 ## 0.2.0
 
 **New**

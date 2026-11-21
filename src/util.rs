@@ -173,3 +173,47 @@ pub fn shell_open(target: &str) {
 pub fn hwnd(v: isize) -> HWND {
     HWND(v as *mut _)
 }
+
+/// Run a program elevated (UAC prompt), hidden, and wait for it.
+/// Returns true if it ran and exited with code 0.
+pub fn run_elevated_wait(file: &str, params: &str) -> bool {
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let f = wide(file);
+    let p = wide(params);
+    let verb = wide("runas");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(f.as_ptr()),
+        lpParameters: PCWSTR(p.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        if ShellExecuteExW(&mut info).is_err() || info.hProcess.is_invalid() {
+            return false;
+        }
+        WaitForSingleObject(info.hProcess, 30_000);
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        code == 0
+    }
+}
+
+/// Log panics (with location) before the process aborts.
+pub fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown".into());
+        log(&format!("CRASH v{} at {loc}: {msg}", env!("CARGO_PKG_VERSION")));
+    }));
+}

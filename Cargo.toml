@@ -1,6 +1,6 @@
 [package]
 name = "switch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A fast, modern Alt-Tab replacement for Windows"
 license = "MIT"
@@ -23,6 +23,7 @@ features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_UI_Controls",
+  "Win32_UI_Controls_Dialogs",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_DirectWrite",

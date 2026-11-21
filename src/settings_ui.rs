@@ -29,14 +29,14 @@ use crate::util::{self, UiCell};
 
 // ---- model ---------------------------------------------------------------------
 
-const PAGES: [&str; 8] = ["General", "Shortcuts", "Appearance", "Layout", "Windows", "Hidden apps", "Updates", "About"];
+const PAGES: [&str; 8] = ["General", "Shortcuts", "Appearance", "Layout", "Windows", "Apps", "Updates", "About"];
 const PAGE_DESC: [&str; 8] = [
     "Startup, tray and system behavior",
     "How you open and drive the switcher",
     "Theme, color, shape and motion",
     "How windows are arranged and labeled",
     "Which windows show up, and in what order",
-    "Apps that never appear in Switch",
+    "Favorite apps come first; hidden apps never appear",
     "Stay on the latest version",
     "Version, resources and troubleshooting",
 ];
@@ -88,6 +88,14 @@ enum K {
     OpenFolder,
     OpenLog,
     Reset,
+    NumberKeys,
+    HotCorner,
+    MouseBtn,
+    Launcher,
+    FavFirst,
+    Prerelease,
+    Export,
+    Import,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -103,6 +111,8 @@ enum Hit {
     Field(K),
     Unhide(usize),
     HideRunning(usize),
+    Unfav(usize),
+    FavRunning(usize),
 }
 
 enum Ctl {
@@ -133,6 +143,7 @@ enum Block {
     Preview,
     Cheats,
     Hidden,
+    Favorites,
     Running,
     Notes,
     AboutHead,
@@ -172,6 +183,8 @@ struct Settings {
     field: Option<(K, String)>,
     confirm_reset: bool,
     running: Vec<(String, String)>,
+    /// 0 off, 1 Run key, 2 elevated logon task (queried once; it spawns schtasks).
+    autostart: usize,
 }
 
 static ST: UiCell<Settings> = UiCell::new();
@@ -260,6 +273,7 @@ unsafe fn create() -> windows::core::Result<()> {
         field: None,
         confirm_reset: false,
         running: Vec::new(),
+        autostart: autostart_mode(),
     });
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -387,14 +401,18 @@ fn memory_usage() -> (f64, f64) {
 
 // ---- pages ----------------------------------------------------------------------
 
-fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
+fn page_blocks(page: usize, confirm_reset: bool, autostart: usize) -> Vec<Block> {
     let c = cfg().clone();
     let paused = hook::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
     match page {
         0 => vec![
             Block::Card(vec![
                 row("Switch is on", "Turn off to bring back the standard Windows Alt+Tab", Ctl::Toggle(K::Enabled, !paused)),
-                row("Start with Windows", "Run Switch in the tray when you sign in", Ctl::Toggle(K::Autostart, autostart_enabled())),
+                row(
+                    "Start with Windows",
+                    "\u{201C}As admin\u{201D} also covers admin apps, with no prompt at sign-in",
+                    Ctl::Seg(K::Autostart, &["Off", "On", "As admin"], autostart),
+                ),
                 row("Tray icon click", "What a left-click on the tray icon does", Ctl::Seg(K::TrayClick, &["Settings", "Open switcher"], c.tray_click.index())),
             ]),
             Block::Section("Performance"),
@@ -424,11 +442,22 @@ fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
                 row("Release Alt to switch", "Off: the switcher stays open until Enter, Esc or a click", Ctl::Toggle(K::Release, c.release_to_switch)),
                 row("Alt+` for the current app", "Cycle between windows of the app you're in", Ctl::Toggle(K::Backtick, c.alt_backtick)),
                 row("Custom shortcut", "Shortcuts with Alt switch on release; others stay open", Ctl::Hotkey),
+                row("Number keys", "Press 1\u{2013}9 to jump straight to a window", Ctl::Toggle(K::NumberKeys, c.number_keys)),
+                row(
+                    "Launch apps from search",
+                    &format!("Typing also finds installed apps ({} indexed)", crate::apps::count()),
+                    Ctl::Toggle(K::Launcher, c.launcher),
+                ),
                 row(
                     "Quick-switch delay",
                     "A tap shorter than this flips windows without showing the switcher",
                     Ctl::Slider(K::Delay, 0, 250, c.show_delay_ms, " ms"),
                 ),
+            ]),
+            Block::Section("Mouse"),
+            Block::Card(vec![
+                row("Hot corner", "Rest the cursor in a screen corner to open Switch", Ctl::Seg(K::HotCorner, &["Off", "\u{2196}", "\u{2197}", "\u{2199}", "\u{2198}"], c.hot_corner.index())),
+                row("Mouse button", "Opens Switch; press again to switch", Ctl::Seg(K::MouseBtn, &["Off", "Back", "Forward"], c.mouse_button.index())),
             ]),
             Block::Section("Inside the switcher"),
             Block::Cheats,
@@ -484,6 +513,7 @@ fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
                 row("Sort by", "Search results are always ranked by match", Ctl::Seg(K::Sort, &["Recent", "App", "Title"], c.sort.index())),
                 row("Start on", "Which window is selected when the switcher opens", Ctl::Seg(K::Initial, &["Previous", "Current"], c.initial.index())),
                 row("Wrap around", "Moving past the last window jumps to the first", Ctl::Toggle(K::Wrap, c.wrap)),
+                row("Favorites first", "Windows of favorite apps lead the list (Ctrl+F in the switcher)", Ctl::Toggle(K::FavFirst, c.favorites_first)),
             ]),
             Block::Section("Mouse"),
             Block::Card(vec![
@@ -492,6 +522,8 @@ fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
             ]),
         ],
         5 => vec![
+            Block::Favorites,
+            Block::Gap(10.0),
             Block::Hidden,
             Block::Gap(10.0),
             Block::Card(vec![row("Hide an app by name", "Type the program's file name and press Enter", Ctl::Field(K::AddHidden, "spotify.exe"))]),
@@ -506,6 +538,7 @@ fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
                 row("Check for updates automatically", "On startup and every 6 hours, from GitHub Releases", Ctl::Toggle(K::AutoUpdate, c.auto_update)),
                 row("Notify me", "Show a notification when a new version is out", Ctl::Toggle(K::Notify, c.notify_updates)),
                 row("Install updates automatically", "Download, verify and restart without asking", Ctl::Toggle(K::AutoInstall, c.auto_install)),
+                row("Beta versions", "Get pre-releases early. They may be less polished", Ctl::Toggle(K::Prerelease, c.prerelease)),
             ]),
         ],
         _ => {
@@ -515,8 +548,21 @@ fn page_blocks(page: usize, confirm_reset: bool) -> Vec<Block> {
                 Block::Section("Resources"),
                 Block::Card(vec![
                     row("Memory in use", "Working set, live", Ctl::Info(format!("{ws:.1} MB"))),
+                    row(
+                        "Last open",
+                        "Finding windows, layout and first frame",
+                        Ctl::Info(match crate::switcher::LAST_OPEN_US.load(std::sync::atomic::Ordering::Relaxed) {
+                            0 => "Not opened yet".into(),
+                            us => format!("{:.1} ms", us as f32 / 1000.0),
+                        }),
+                    ),
                     row("Private memory", "", Ctl::Info(format!("{private:.1} MB"))),
                     row("Process", "", Ctl::Info(if crate::is_elevated() { "Administrator".into() } else { "Standard user".into() })),
+                ]),
+                Block::Section("Backup"),
+                Block::Card(vec![
+                    row("Export settings", "Saves Switch-settings.json to your Documents folder", Ctl::Button(K::Export, "Export".into(), false)),
+                    row("Import settings", "Load a settings file from another PC", Ctl::Button(K::Import, "Import\u{2026}".into(), false)),
                 ]),
                 Block::Section("Troubleshooting"),
                 Block::Card(vec![
@@ -674,7 +720,7 @@ impl Settings {
         p.text(PAGE_DESC[self.page], &f.desc, R::new(x0, y, cw, 18.0 * s), pal.subtext);
         y += 34.0 * s;
 
-        for b in page_blocks(self.page, self.confirm_reset) {
+        for b in page_blocks(self.page, self.confirm_reset, self.autostart) {
             y = match b {
                 Block::Section(t) => {
                     p.text(t, &f.section, R::new(x0 + 2.0 * s, y + 14.0 * s, cw, 20.0 * s), pal.subtext);
@@ -685,6 +731,7 @@ impl Settings {
                 Block::Preview => self.preview(p, pal, f, x0, y, cw) + 4.0 * s,
                 Block::Cheats => self.cheats(p, pal, f, x0, y, cw),
                 Block::Hidden => self.hidden(p, pal, f, x0, y, cw),
+                Block::Favorites => self.favorites(p, pal, f, x0, y, cw),
                 Block::Running => self.running_apps(p, pal, f, x0, y, cw),
                 Block::Notes => self.notes(p, pal, f, x0, y, cw),
                 Block::AboutHead => self.about_head(p, pal, f, x0, y, cw),
@@ -992,7 +1039,11 @@ impl Settings {
             ("Ctrl+Shift+W", "Close every window of that app"),
             ("Ctrl+M / Ctrl+Up", "Minimize / maximize or restore"),
             ("Ctrl+Left / Ctrl+Right", "Move the window to another monitor"),
+            ("1\u{2013}9", "Jump straight to that window"),
             ("Ctrl+P", "Pin the window on top"),
+            ("Ctrl+Shift+Left / Right", "Snap the window to the left / right half"),
+            ("Ctrl+S", "Put it side by side with the window you came from"),
+            ("Ctrl+F", "Make the app a favorite"),
             ("Ctrl+N / Ctrl+O", "New window of the app / open its file location"),
             ("Ctrl+H", "Hide the app from Switch"),
             ("Ctrl+G / Ctrl+L", "Cycle grouping / layout"),
@@ -1013,8 +1064,41 @@ impl Settings {
     }
 
     fn hidden(&mut self, p: &Painter, pal: &Palette, f: &Fmts, x: f32, y: f32, w: f32) -> f32 {
-        let s = self.scale;
         let apps = cfg().hidden_apps.clone();
+        let title = format!("{} hidden app{}", apps.len(), if apps.len() == 1 { "" } else { "s" });
+        let desc = if apps.is_empty() {
+            "Never shown in Switch. Press Ctrl+H in the switcher, or use the list below."
+        } else {
+            "These never appear in Switch. Click \u{00D7} to show one again."
+        };
+        self.chips(p, pal, f, x, y, w, &title, desc, &apps, Hit::Unhide)
+    }
+
+    fn favorites(&mut self, p: &Painter, pal: &Palette, f: &Fmts, x: f32, y: f32, w: f32) -> f32 {
+        let apps = cfg().favorites.clone();
+        let title = format!("{} favorite app{}", apps.len(), if apps.len() == 1 { "" } else { "s" });
+        let desc = if apps.is_empty() {
+            "Favorites lead the list. Press Ctrl+F in the switcher, or use the list below."
+        } else {
+            "Their windows come first in Switch. Click \u{00D7} to remove one."
+        };
+        self.chips(p, pal, f, x, y, w, &title, desc, &apps, Hit::Unfav)
+    }
+
+    fn chips(
+        &mut self,
+        p: &Painter,
+        pal: &Palette,
+        f: &Fmts,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        desc: &str,
+        apps: &[String],
+        hit_of: fn(usize) -> Hit,
+    ) -> f32 {
+        let s = self.scale;
         let pad = 20.0 * s;
         let chip_h = 30.0 * s;
         let mut chips: Vec<(R, usize)> = Vec::new();
@@ -1031,20 +1115,10 @@ impl Settings {
         let bottom = if apps.is_empty() { y + 62.0 * s } else { cy + chip_h + pad };
         let card = R::new(x, y, w, bottom - y);
         self.card_bg(p, pal, card);
-        p.text(
-            &format!("{} hidden app{}", apps.len(), if apps.len() == 1 { "" } else { "s" }),
-            &f.label,
-            R::new(x + pad, y + 11.0 * s, w * 0.6, 22.0 * s),
-            pal.text,
-        );
-        let desc = if apps.is_empty() {
-            "Press Ctrl+H in the switcher, or use the list below."
-        } else {
-            "Click \u{00D7} to show an app again."
-        };
+        p.text(title, &f.label, R::new(x + pad, y + 11.0 * s, w * 0.6, 22.0 * s), pal.text);
         p.text(desc, &f.desc, R::new(x + pad, y + 33.0 * s, w - 2.0 * pad, 18.0 * s), pal.subtext);
         for (r, i) in chips {
-            let hit = Hit::Unhide(i);
+            let hit = hit_of(i);
             p.fill(r, r.h / 2.0, if self.hover == Some(hit) { pal.surface_hover } else { pal.thumb_bg });
             p.text(&apps[i], &f.ctl, R::new(r.x + 14.0 * s, r.y, r.w - 38.0 * s, r.h), pal.text);
             p.glyph_close(r.right() - 17.0 * s, r.y + r.h / 2.0, 3.5 * s, pal.subtext, 1.2 * s);
@@ -1076,14 +1150,26 @@ impl Settings {
             if k > 0 {
                 p.line(x + 18.0 * s, ry, x + w - 18.0 * s, ry, pal.border, 1.0 * s);
             }
-            p.text(&name, &f.label, R::new(x + 20.0 * s, ry, w * 0.45, row_h), pal.text);
-            p.text(&exe, &f.small, R::new(x + w * 0.45, ry, w * 0.3, row_h), pal.faint);
+            p.text(&name, &f.label, R::new(x + 20.0 * s, ry, w * 0.4, row_h), pal.text);
+            p.text(&exe, &f.small, R::new(x + w * 0.42, ry, w * 0.25, row_h), pal.faint);
             let bw = 70.0 * s;
             let br = R::new(x + w - 20.0 * s - bw, ry + (row_h - 30.0 * s) / 2.0, bw, 30.0 * s);
             let hit = Hit::HideRunning(i);
             p.fill(br, 7.0 * s, if self.hover == Some(hit) { pal.surface_hover } else { pal.thumb_bg });
             p.text("Hide", &f.ctl_c, br, pal.text);
             self.hits.push((br, hit));
+            let fav = cfg().favorites.contains(&exe);
+            let fw = 96.0 * s;
+            let fr = R::new(br.x - 8.0 * s - fw, br.y, fw, br.h);
+            let fhit = Hit::FavRunning(i);
+            if fav {
+                p.fill(fr, 7.0 * s, pal.accent.a(if self.hover == Some(fhit) { 0.3 } else { 0.18 }));
+                p.text("\u{2605} Favorite", &f.ctl_c, fr, pal.accent);
+            } else {
+                p.fill(fr, 7.0 * s, if self.hover == Some(fhit) { pal.surface_hover } else { pal.thumb_bg });
+                p.text("\u{2606} Favorite", &f.ctl_c, fr, pal.text);
+            }
+            self.hits.push((fr, fhit));
         }
         card.bottom()
     }
@@ -1322,7 +1408,7 @@ impl Settings {
                     hook::PAUSED.store(p, std::sync::atomic::Ordering::Relaxed);
                     crate::tray_update();
                 }
-                K::Autostart => set_autostart(!autostart_enabled()),
+
                 K::TrimMemory => c.trim_memory = !c.trim_memory,
                 K::AltTab => c.alt_tab = !c.alt_tab,
                 K::Release => c.release_to_switch = !c.release_to_switch,
@@ -1339,15 +1425,49 @@ impl Settings {
                 K::AutoUpdate => {
                     c.auto_update = !c.auto_update;
                     if c.auto_update {
-                        updater::check_async(true);
+                        updater::check_async(true, cfg().prerelease);
                     }
                 }
                 K::Notify => c.notify_updates = !c.notify_updates,
+                K::NumberKeys => c.number_keys = !c.number_keys,
+                K::Launcher => {
+                    c.launcher = !c.launcher;
+                    if c.launcher {
+                        crate::apps::refresh_async();
+                    }
+                }
+                K::FavFirst => c.favorites_first = !c.favorites_first,
+                K::Prerelease => {
+                    c.prerelease = !c.prerelease;
+                    updater::check_async(true, c.prerelease);
+                }
                 K::AutoInstall => c.auto_install = !c.auto_install,
                 _ => {}
             },
             Hit::Seg(k, i) => match k {
                 K::TrayClick => c.tray_click = TrayClick::from_index(i),
+                K::HotCorner => c.hot_corner = Corner::from_index(i),
+                K::MouseBtn => c.mouse_button = MouseButton::from_index(i),
+                K::Autostart if i != self.autostart => {
+                    let had_task = self.autostart == 2;
+                    match i {
+                        0 => {
+                            set_autostart(false);
+                            if had_task {
+                                set_admin_task(false);
+                            }
+                        }
+                        1 => {
+                            if !had_task || set_admin_task(false) {
+                                set_autostart(true);
+                            }
+                        }
+                        _ => {
+                            set_admin_task(true);
+                        }
+                    }
+                    self.autostart = autostart_mode();
+                }
                 K::Theme => {
                     c.theme = Theme::from_index(i);
                     unsafe { apply_titlebar(self.hwnd) };
@@ -1390,6 +1510,21 @@ impl Settings {
                     c.hidden_apps.remove(i);
                 }
             }
+            Hit::Unfav(i) => {
+                if i < c.favorites.len() {
+                    c.favorites.remove(i);
+                }
+            }
+            Hit::FavRunning(i) => {
+                if let Some((exe, _)) = self.running.get(i) {
+                    match c.favorites.iter().position(|f| f == exe) {
+                        Some(p) => {
+                            c.favorites.remove(p);
+                        }
+                        None => c.favorites.push(exe.clone()),
+                    }
+                }
+            }
             Hit::HideRunning(i) => {
                 if let Some((exe, _)) = self.running.get(i) {
                     if !c.hidden_apps.contains(exe) {
@@ -1400,9 +1535,16 @@ impl Settings {
             Hit::Button(k) => match k {
                 K::UpdateNow => match updater::state() {
                     State::Available(_) => updater::install_async(),
-                    _ => updater::check_async(false),
+                    _ => updater::check_async(false, cfg().prerelease),
                 },
                 K::RunAsAdmin => crate::restart_as_admin(),
+                K::Export => export_settings(),
+                K::Import => {
+                    if import_settings(self.hwnd) {
+                        unsafe { apply_titlebar(self.hwnd) };
+                        self.autostart = autostart_mode();
+                    }
+                }
                 K::OpenRepo => util::shell_open(&format!("https://github.com/{}", updater::REPO)),
                 K::OpenReleases => util::shell_open(&format!("https://github.com/{}/releases", updater::REPO)),
                 K::OpenFolder => util::shell_open(&util::data_dir().to_string_lossy()),
@@ -1709,4 +1851,55 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         _ => {}
     }
     DefWindowProcW(h, msg, w, l)
+}
+
+fn export_settings() {
+    let docs = std::env::var_os("USERPROFILE")
+        .map(|p| std::path::PathBuf::from(p).join("Documents"))
+        .unwrap_or_else(util::data_dir);
+    let _ = std::fs::create_dir_all(&docs);
+    let path = docs.join("Switch-settings.json");
+    if let Ok(json) = serde_json::to_string_pretty(cfg()) {
+        if std::fs::write(&path, json).is_ok() {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+            return;
+        }
+    }
+    util::log("settings export failed");
+}
+
+/// Pick a settings file and load it. Returns true if something was imported.
+fn import_settings(owner: HWND) -> bool {
+    use windows::Win32::UI::Controls::Dialogs::*;
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "Switch settings (*.json)\0*.json\0All files\0*.*\0\0".encode_utf16().collect();
+    let title = util::wide("Import Switch settings");
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        return false;
+    }
+    let path = util::from_wide(&buf);
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    match import_from_str(&text) {
+        Some(c) => {
+            *cfg() = c;
+            save_and_apply();
+            true
+        }
+        None => {
+            util::log(&format!("import: {path} is not a Switch settings file"));
+            false
+        }
+    }
 }

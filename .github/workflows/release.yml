@@ -1,41 +1,75 @@
-# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a release.
-# The built-in updater downloads Switch.exe and verifies it against Switch.exe.sha256.
+# Publishes a release automatically whenever the version in Cargo.toml changes
+# on main (or a v* tag is pushed). No manual tagging needed: bump the version,
+# add a CHANGELOG section, push.
+#
+# The built-in updater downloads Switch.exe and verifies it against
+# Switch.exe.sha256, and shows the CHANGELOG section as release notes.
+# Versions with a pre-release suffix (0.4.0-beta.1) are published as
+# pre-releases, which only reach users who turned on "Beta versions".
 name: Release
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check tag matches Cargo.toml version
+      - name: Read version and check for an existing release
+        id: ver
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ("v$ver" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $ver" }
+          $tag = "v$ver"
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne $tag) {
+            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $ver"
+          }
+          gh release view $tag --repo "${{ github.repository }}" --json assets --jq '.assets[].name' 2>$null | Out-File assets.txt
+          $done = (Test-Path assets.txt) -and (Select-String -Path assets.txt -Pattern '^Switch\.exe$' -Quiet)
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "prerelease=$(if ($ver -match '-') { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+          "skip=$(if ($done) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+          if ($done) { Write-Host "$tag is already published; nothing to do." }
+          # `gh release view` fails when the release doesn't exist yet; that's expected.
+          $global:LASTEXITCODE = 0
 
-      - run: cargo build --release
+      - if: steps.ver.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.ver.outputs.skip == 'false'
+        run: cargo test --release
+
+      - if: steps.ver.outputs.skip == 'false'
+        run: cargo build --release
 
       - name: Package
+        if: steps.ver.outputs.skip == 'false'
         shell: pwsh
         run: |
           Copy-Item target/release/Switch.exe Switch.exe
           $hash = (Get-FileHash Switch.exe -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path Switch.exe.sha256 -Value "$hash  Switch.exe" -NoNewline -Encoding ascii
 
-      # Release notes come from this version's section of CHANGELOG.md, and the
-      # built-in updater shows them in Settings -> Updates.
+      # Release notes come from this version's section of CHANGELOG.md.
       - name: Release notes
+        if: steps.ver.outputs.skip == 'false'
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
+          $v = "${{ steps.ver.outputs.version }}"
           $out = @(); $on = $false
           foreach ($l in Get-Content CHANGELOG.md) {
             if ($l -match '^## ') { if ($on) { break }; $on = ($l.Trim() -eq "## $v"); continue }
@@ -44,8 +78,13 @@ jobs:
           if ($out.Count -eq 0) { $out = @("Switch $v") }
           Set-Content -Path notes.md -Value ($out -join "`n").Trim() -Encoding utf8
 
-      - uses: softprops/action-gh-release@v2
+      - if: steps.ver.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Switch ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.ver.outputs.prerelease }}
           files: |
             Switch.exe
             Switch.exe.sha256
